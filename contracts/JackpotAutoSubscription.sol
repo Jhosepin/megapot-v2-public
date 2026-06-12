@@ -1,3 +1,149 @@
+
+pragma solidity ^0.8.28;
+
+import { IERC721 } from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+
+import { BuyTicketsHelpers } from "./lib/BuyTicketsHelpers.sol";
+import { IBatchPurchaseFacilitator } from "./interfaces/IBatchPurchaseFacilitator.sol";
+import { IJackpot } from "./interfaces/IJackpot.sol";
+import { JackpotErrors } from "./lib/JackpotErrors.sol";
+import { AllowedManager } from "./lib/AllowedManager.sol";
+import { TicketPicker } from "./lib/TicketPicker.sol";
+
+contract JackpotAutoSubscription is Ownable2Step, ReentrancyGuardTransient, AllowedManager {
+
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           ENUMS
+    // =============================================================
+
+  enum ExecutionAction {
+      EXECUTE,                      // Successfully executed, subscription continues
+      EXECUTE_AND_CLOSE,            // Final execution, subscription completed
+      SKIP_ALREADY_EXECUTED,        // Already executed this drawing
+      SKIP_NO_ACTIVE_SUBSCRIPTION,  // No active subscription
+      SKIP_ACTIVE_BATCH_ORDER,      // Active batch order, skip execution
+      CANCEL_PRICE_CHANGE,          // Price changed, auto-cancelled with refund
+      CANCEL_TOO_MANY_REFERRERS,    // Too many referrers, auto-cancelled with refund
+      CANCEL_USER_REQUESTED         // User requested cancellation
+  }
+
+    // =============================================================
+    //                           STRUCTS
+    // =============================================================
+
+    struct Subscription {
+        uint64 remainingUSDC;
+        uint64 lastExecutedDrawing;
+        uint64 subscribedTicketPrice;
+        uint64 dynamicTicketCount;
+        address[] referrers;          // Stored referral addresses for execution
+        uint256[] referralSplit;      // PRECISE_UNIT-scaled weights matching referrers
+    }
+
+    struct SubscriptionInfo {
+        Subscription subscription;
+        IJackpot.Ticket[] staticTickets;
+    }
+
+    // =============================================================
+    //                           EVENTS
+    // =============================================================
+
+    event SubscriptionCreated(
+        address indexed payer,
+        address indexed recipient,
+        uint256 totalCost,
+        uint256 totalDays,
+        uint256 drawingStart,
+        uint256 dynamicTicketCount,
+        uint256 staticTicketCount,
+        uint256 ticketPrice
+    );
+
+    event StaticTicketAdded(
+        address indexed recipient,
+        uint8[] normals,
+        uint8 bonusball
+    );
+
+    event SubscriptionCancelled(
+        address indexed recipient,
+        ExecutionAction indexed executionAction,
+        uint64 refundAmount
+    );
+
+    event SubscriptionExecuted(
+        address indexed recipient,
+        uint256 indexed drawingId,
+        uint256[] ticketIds,
+        uint256 dynamicTicketsPurchased,
+        uint256 staticTicketsPurchased
+    );
+
+    event SubscriptionRoutedToBatch(
+        address indexed recipient,
+        uint256 indexed drawingId,
+        uint256 dynamicTicketCount,
+        uint256 staticTicketCount,
+        uint256 totalCost
+    );
+
+    event SubscriptionSkipped(
+        address indexed recipient,
+        uint256 indexed drawingId,
+        ExecutionAction indexed executionAction
+    );
+
+    event SubscriptionRemoved(address indexed recipient);
+
+    event BatchPurchaseFacilitatorSet(address indexed batchPurchaseFacilitator);
+
+    // =============================================================
+    //                           ERRORS
+    // =============================================================
+
+    error ActiveSubscriptionExists();
+    error NoActiveSubscription();
+    error InvalidDuration();
+    error InvalidTicketCount();
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+    bytes32 private constant AUTO_SUBSCRIPTION_TELEMETRY = "auto-subscription";
+
+    // =============================================================
+    //                           STATE VARIABLES
+    // =============================================================
+
+    mapping(address => Subscription) public subscriptions;
+    mapping(address => IJackpot.Ticket[]) public staticTickets;
+
+    uint256 public ticketPickerNonce;
+
+    IJackpot public immutable jackpot;
+    IERC20 public immutable usdc;
+    IBatchPurchaseFacilitator public batchFacilitator;
+
+    // =============================================================
+    //                           CONSTRUCTOR
+    // =============================================================
+    constructor(
+        address _jackpot,
+        address _usdc,
+        address _batchFacilitator
+    ) AllowedManager() {
+        jackpot = IJackpot(_jackpot);
+        usdc = IERC20(_usdc);
+        batchFacilitator = IBatchPurchaseFacilitator(_batchFacilitator);
+    }
 //SPDX-License-Identifier: UNLICENSED
 
 /*
